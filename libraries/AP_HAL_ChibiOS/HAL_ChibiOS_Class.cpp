@@ -118,7 +118,7 @@ HAL_ChibiOS::HAL_ChibiOS() :
         &spiDeviceManager,
         &analogIn,
         &storageDriver,
-        &uartADriver,
+        &uartGDriver,
         &gpioDriver,
         &rcinDriver,
         &rcoutDriver,
@@ -297,7 +297,8 @@ void HAL_ChibiOS::run(int argc, char * const argv[], Callbacks* callbacks) const
 
     assert(callbacks);
     g_callbacks = callbacks;
-
+    hal.uartG->begin(57600);
+    hal.uartG->printf("run\n");
     //Takeover main
     main_loop();
 }
