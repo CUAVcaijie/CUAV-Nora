@@ -1,6 +1,8 @@
 from __future__ import print_function
 
 import abc
+import copy
+import errno
 import math
 import os
 import re
@@ -12,6 +14,8 @@ import pexpect
 import fnmatch
 import operator
 import numpy
+import socket
+import struct
 
 from MAVProxy.modules.lib import mp_util
 
@@ -161,6 +165,346 @@ class MAVProxyLogFile(object):
             self.fh.flush()
         else:
             sys.stdout.flush()
+
+class FRSky(object):
+    def __init__(self, destination_address):
+        self.destination_address = destination_address
+
+        self.buffer = ""
+        self.connected = False
+        self.port = None
+
+        self.dataid_GPS_ALT_BP          = 0x01
+        self.dataid_TEMP1               = 0x02
+        self.dataid_FUEL                = 0x04
+        self.dataid_TEMP2               = 0x05
+        self.dataid_GPS_ALT_AP          = 0x09
+        self.dataid_BARO_ALT_BP         = 0x10
+        self.dataid_GPS_SPEED_BP        = 0x11
+        self.dataid_GPS_LONG_BP         = 0x12
+        self.dataid_GPS_LAT_BP          = 0x13
+        self.dataid_GPS_COURS_BP        = 0x14
+        self.dataid_GPS_SPEED_AP        = 0x19
+        self.dataid_GPS_LONG_AP         = 0x1A
+        self.dataid_GPS_LAT_AP          = 0x1B
+        self.dataid_BARO_ALT_AP         = 0x21
+        self.dataid_GPS_LONG_EW         = 0x22
+        self.dataid_GPS_LAT_NS          = 0x23
+        self.dataid_CURRENT             = 0x28
+        self.dataid_VFAS                = 0x39
+
+    def connect(self):
+        try:
+            self.connected = False
+            self.progress("Connecting to (%s:%u)" % self.destination_address)
+            if self.port is not None:
+                try:
+                    self.port.close() # might be reopening
+                except Exception as e:
+                    pass
+            self.port = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.port.connect(self.destination_address)
+            self.port.setblocking(0)
+            self.port.setsockopt(socket.SOL_TCP, socket.TCP_NODELAY, 1)
+            self.connected = True
+            self.progress("Connected")
+        except IOError as e:
+            self.progress("Failed to connect: %s" % str(e))
+            time.sleep(0.5)
+            return False
+        return True
+
+    def do_read(self):
+        try:
+            data = self.port.recv(1024)
+        except socket.error as e:
+            if e.errno not in [ errno.EAGAIN, errno.EWOULDBLOCK ]:
+                self.progress("Exception: %s" % str(e))
+                self.connected = False
+            return ""
+        if len(data) == 0:
+            self.progress("EOF")
+            self.connected = False
+            return ""
+#        self.progress("Read %u bytes" % len(data))
+        return data
+
+    def update(self):
+        if not self.connected:
+            if not self.connect():
+                return
+        self.update_read()
+
+class FRSkyD(FRSky):
+    def __init__(self, destination_address):
+        super(FRSkyD, self).__init__(destination_address)
+
+        self.state_WANT_START_STOP_D = 16,
+        self.state_WANT_ID = 17,
+        self.state_WANT_BYTE1 = 18,
+        self.state_WANT_BYTE2 = 19,
+
+        self.START_STOP_D = 0x5E
+        self.BYTESTUFF_D = 0x5D
+
+        self.state = self.state_WANT_START_STOP_D
+
+        self.data_by_id = {}
+        self.bad_chars = 0
+
+    def progress(self, message):
+        print("FRSkyD: %s" % message)
+
+    def handle_data(self, dataid, value):
+        self.progress("%u=%u" % (dataid, value))
+        self.data_by_id[dataid] = value
+
+    def update_read(self):
+        self.buffer += self.do_read()
+        consume = None
+        while len(self.buffer):
+            if consume is not None:
+                self.buffer = self.buffer[consume:]
+            if len(self.buffer) == 0:
+                break
+            consume = 1
+            b = ord(self.buffer[0])
+            if self.state == self.state_WANT_START_STOP_D:
+                if b != self.START_STOP_D:
+                    # we may come into a stream mid-way, so we can't judge
+                    self.bad_chars += 1
+                    continue
+                self.state = self.state_WANT_ID
+                continue
+            elif self.state == self.state_WANT_ID:
+                self.dataid = b
+                self.state = self.state_WANT_BYTE1
+                continue
+            elif self.state in [self.state_WANT_BYTE1, self.state_WANT_BYTE2]:
+                if b == 0x5D:
+                    # byte-stuffed
+                    if len(self.buffer) < 2:
+                        # try again in a little while
+                        consume = 0
+                        return
+                    if ord(self.buffer[1]) == 0x3E:
+                        b = self.START_STOP_D
+                    elif ord(self.buffer[1]) == 0x3D:
+                        b = self.BYTESTUFF_D;
+                    else:
+                        raise ValueError("Unknown stuffed byte")
+                    consume = 2
+                if self.state == self.state_WANT_BYTE1:
+                    self.b1 = b
+                    self.state = self.state_WANT_BYTE2
+                    continue
+
+                data = self.b1 | b << 8
+                self.handle_data(self.dataid, data)
+                self.state = self.state_WANT_START_STOP_D
+
+    def get_data(self, dataid):
+        try:
+            return self.data_by_id[dataid]
+        except KeyError as e:
+            pass
+        return None
+
+
+class FRSkySPort(FRSky):
+    def __init__(self, destination_address):
+        super(FRSkySPort, self).__init__(destination_address)
+
+        self.state_SEND_POLL = 34
+        self.state_WANT_FRAME_TYPE = 35
+        self.state_WANT_ID1 = 36,
+        self.state_WANT_ID2 = 37,
+        self.state_WANT_DATA = 38,
+        self.state_WANT_CRC = 39,
+
+        self.START_STOP_SPORT = 0x7E
+        self.BYTESTUFF_SPORT  = 0x7D
+        self.SPORT_DATA_FRAME = 0x10
+
+        self.SENSOR_ID_VARIO             = 0x00 # Sensor ID  0
+        self.SENSOR_ID_FAS               = 0x22 # Sensor ID  2
+        self.SENSOR_ID_GPS               = 0x83 # Sensor ID  3
+        self.SENSOR_ID_SP2UR             = 0xC6 # Sensor ID  6
+        self.SENSOR_ID_28                = 0x1B # Sensor ID 28
+
+        self.state = self.state_WANT_FRAME_TYPE
+
+        self.data_by_id = {}
+        self.bad_chars = 0
+
+        self.poll_sent = 0
+
+        self.id_descriptions = {
+            0x5000: "status text (dynamic)",
+            0x5006: "Attitude and range (dynamic)",
+            0x800: "GPS lat (600 with 1 sensor)",
+            0x800: "GPS lon (600 with 1 sensor)",
+            0x5005: "Vel and Yaw",
+            0x5001: "AP status",
+            0x5002: "GPS Status",
+            0x5004: "Home",
+            0x5008: "Battery 2 status",
+            0x5003: "Battery 1 status",
+            0x5007: "parameters",
+
+            # SPort non-passthrough:
+            0x02: "Temp1",
+            0x04: "Fuel",
+            0x05: "Temp2",
+            0x10: "Baro Alt BP",
+            0x13: "GPS_LAT_BP",
+            0x1B: "GPS_LAT_AP",
+            0x21: "BARO_ALT_AP",
+            0x39: "VFAS",
+        }
+
+        self.sensors_to_poll = [
+            self.SENSOR_ID_VARIO,
+            self.SENSOR_ID_FAS,
+            self.SENSOR_ID_GPS,
+            self.SENSOR_ID_SP2UR,
+        ]
+        self.next_sensor_id_to_poll = 0 # offset into sensors_to_poll
+
+    def progress(self, message):
+        print("FRSkySPort: %s" % message)
+
+    def handle_data(self, dataid, value):
+        self.progress("%s (0x%x)=%u" % (self.id_descriptions[dataid], dataid, value))
+        self.data_by_id[dataid] = value
+
+    def read_bytestuffed_byte(self):
+        if ord(self.buffer[0]) == 0x7D:
+            # byte-stuffed
+            if len(self.buffer) < 2:
+                self.consume = 0
+                return None
+            self.consume = 2
+            if ord(self.buffer[1]) == 0x5E:
+                return self.START_STOP_SPORT
+            if ord(self.buffer[1]) == 0x5D:
+                return self.BYTESTUFF_SPORT
+            raise ValueError("Unknown stuffed byte (0x%02x)" % ord(self.buffer[1]))
+        return ord(self.buffer[0])
+
+    def calc_crc(self, byte):
+        self.crc += byte
+        self.crc += self.crc >> 8
+        self.crc &= 0xFF
+
+    def next_sensor(self):
+        ret =  self.sensors_to_poll[self.next_sensor_id_to_poll]
+        self.next_sensor_id_to_poll += 1
+        if self.next_sensor_id_to_poll >= len(self.sensors_to_poll):
+            self.next_sensor_id_to_poll = 0
+        return ret
+
+    def check_poll(self):
+        now = time.time()
+        if now - self.poll_sent > 2:
+            if self.state != self.state_WANT_FRAME_TYPE:
+                raise ValueError("Expected to be wanting a frame type when repolling")
+            self.progress("Re-polling")
+            self.state = self.state_SEND_POLL
+
+        if self.state == self.state_SEND_POLL:
+            sensor_id = self.next_sensor()
+            self.progress("Sending poll for 0x%02x" % sensor_id)
+            buf = struct.pack('<BB', self.START_STOP_SPORT, sensor_id)
+            self.port.sendall(buf)
+            self.state = self.state_WANT_FRAME_TYPE
+            self.poll_sent = now
+
+    def update(self):
+        if not self.connected:
+            if not self.connect():
+                return
+        self.check_poll()
+        self.do_sport_read()
+
+    def do_sport_read(self):
+        self.buffer += self.do_read()
+        self.consume = None
+        while len(self.buffer):
+            if self.consume is not None:
+                self.buffer = self.buffer[self.consume:]
+            if len(self.buffer) == 0:
+                break
+            self.consume = 1
+            b = ord(self.buffer[0])
+#            self.progress("Have (%s) bytes state=%s b=0x%02x" % (str(len(self.buffer)), str(self.state), b));
+            if self.state == self.state_WANT_FRAME_TYPE:
+                if b != self.SPORT_DATA_FRAME:
+                    # we may come into a stream mid-way, so we can't judge
+                    self.progress("############# Bad char %x" % b)
+                    raise ValueError("Bad char (0x%02x)" % b)
+                    self.bad_chars += 1
+                    continue
+                self.crc = 0
+                self.calc_crc(b)
+                self.state = self.state_WANT_ID1
+                continue
+            elif self.state == self.state_WANT_ID1:
+                self.id1 = self.read_bytestuffed_byte()
+                if self.id1 is None:
+                    break
+                self.calc_crc(self.id1)
+                self.state = self.state_WANT_ID2
+                continue
+            elif self.state == self.state_WANT_ID2:
+                self.id2 = self.read_bytestuffed_byte()
+                if self.id2 is None:
+                    break
+                self.calc_crc(self.id2)
+                self.state = self.state_WANT_DATA
+                self.data_byte_count = 0
+                self.data = 0
+                continue
+            elif self.state == self.state_WANT_DATA:
+                data_byte = self.read_bytestuffed_byte()
+                if data_byte is None:
+                    break
+                self.calc_crc(data_byte)
+                self.data = self.data | (data_byte << (8*(self.data_byte_count)))
+                self.data_byte_count += 1
+                if self.data_byte_count == 4:
+                    self.state = self.state_WANT_CRC
+                continue
+            elif self.state == self.state_WANT_CRC:
+                crc = self.read_bytestuffed_byte()
+                if crc is None:
+                    break
+                self.crc = 0xFF - self.crc
+                dataid = (self.id2 << 8) | self.id1
+                if self.crc != crc:
+                    self.progress("Incorrect frsky checksum (received=%02x calculated=%02x id=0x%x)" % (crc, self.crc, dataid))
+#                    raise ValueError("Incorrect frsky checksum (want=%02x got=%02x id=0x%x)" % (crc, self.crc, dataid))
+                else:
+                    self.handle_data(dataid, self.data)
+                self.state = self.state_SEND_POLL
+            else:
+                raise ValueError("Unknown state (%u)" % self.state)
+
+    def get_data(self, dataid):
+        try:
+            return self.data_by_id[dataid]
+        except KeyError as e:
+            pass
+        return None
+
+class FRSkyPassThrough(FRSkySPort):
+    def __init__(self, destination_address):
+        super(FRSkyPassThrough, self).__init__(destination_address)
+
+        self.sensors_to_poll = [self.SENSOR_ID_28]
+
+    def progress(self, message):
+        print("FRSkyPassthrough: %s" % message)
 
 class AutoTest(ABC):
     """Base abstract class.
@@ -3653,14 +3997,14 @@ switch value'''
         tstart = self.get_sim_time()
         while True:
             now = self.get_sim_time()
-            if now - tstart > 2:
+            if now - tstart > 20:
                 raise NotAchievedException("NMEA output not updating?!")
-            gps2 = self.mav.recv_match(type="GPS2_RAW", blocking=True, timeout=10)
+            gps2 = self.mav.recv_match(type="GPS2_RAW", blocking=True, timeout=1)
+            self.progress("gps2=%s" % str(gps2))
+            if gps2 is None:
+                continue
             if gps2.time_usec != 0:
                 break
-        self.progress("gps2=(%s)" % str(gps2))
-        if gps2 is None:
-            raise NotAchievedException("Did not receive GPS2_RAW")
         if self.get_distance_int(gps1, gps2) > 1:
             raise NotAchievedException("NMEA output inaccurate")
 
@@ -3737,6 +4081,155 @@ switch value'''
             raise NotAchievedException("last_change_ms same as first message")
         if m3.state != 0:
             raise NotAchievedException("Didn't get expected mask back in message (mask=0 state=%u" % (m3.state))
+
+    def tfp_validate_vel_and_yaw(self, value):
+        self.progress("validating vel_and_yaw(0x%02x)" % value)
+        VELANDYAW_XYVEL_OFFSET = 9
+        VELANDYAW_YAW_LIMIT = 0x7FF
+        VELANDYAW_YAW_OFFSET = 16
+        yaw = value >> VELANDYAW_YAW_OFFSET
+        xy_vel = value >> VELANDYAW_XYVEL_OFFSET & 0xFF
+        z_vel_dm_per_second = value & 0xFFFF
+
+        gpi = self.mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
+        if gpi is None:
+            return
+        self.progress(" yaw=%u gpi=%u" % (yaw, gpi.hdg))
+        self.progress(" xy_vel=%u" % xy_vel)
+        self.progress(" z_vel_dm_per_second=%u" % z_vel_dm_per_second)
+        if int(round(yaw/10,3)) == int(round(gpi.hdg/100, 3)):
+            self.progress("Yaw match")
+            return True
+              # FIXME: need to be under way to check the velocities, really....
+        return False
+
+    def tfp_validate_battery1(self, value):
+        self.progress("validating battery1 (0x%02x)" % value)
+        BATT_VOLTAGE_LIMIT            = 0x1FF
+        BATT_CURRENT_OFFSET           = 9
+        BATT_TOTALMAH_LIMIT           = 0x7FFF
+        BATT_TOTALMAH_OFFSET          = 17
+        voltage = (value & BATT_VOLTAGE_LIMIT)/10.0
+        batt = self.mav.recv_match(
+            type='BATTERY_STATUS',
+            blocking=True,
+            timeout=5,
+            condition="BATTERY_STATUS.id==0"
+        )
+        if batt is None:
+            raise NotAchievedException("Did not get BATTERY_STATUS message")
+        battery_status_value = batt.voltages[0]/1000.0
+        self.progress("BATTERY_STATUS==%f frsky==%f" % (battery_status_value, voltage))
+        if abs(battery_status_value - voltage) > 0.1:
+            return False
+        return True
+
+    def test_frsky_passthrough(self):
+        self.set_parameter("SERIAL5_PROTOCOL", 10) # serial5 is FRSky passthrough
+        self.customise_SITL_commandline([
+            "--uartF=tcp:6735" # serial5 spews to localhost:6735
+        ])
+        frsky = FRSkyPassThrough(("127.0.0.1", 6735))
+        self.wait_ready_to_arm()
+        self.drain_mav_unparsed()
+        # anything with a lambda in here needs a proper test written.
+        # This, at least makes sure we're getting some of each
+        # message.  These are ordered according to the wfq scheduler
+        wants = {
+            0x5000: lambda x : True,
+            0x5006: lambda x : True,
+            0x800: lambda x : True,
+            0x5005: self.tfp_validate_vel_and_yaw,
+            0x5001: lambda x : True,
+            0x5002: lambda x : True,
+            0x5004: lambda x : True,
+            #            0x5008: lambda x : True, # no second battery, so this doesn't arrive
+            0x5003: self.tfp_validate_battery1,
+            0x5007: lambda x : True,
+        }
+        tstart = self.get_sim_time_cached()
+        while len(wants):
+            self.progress("Still wanting (%s)" % ",".join([ ("0x%02x" % x) for x in wants.keys()]))
+            wants_copy = copy.copy(wants)
+            t2 = self.get_sim_time_cached()
+            if t2 - tstart > 10:
+                raise AutoTestTimeoutException("Failed to get frsky data")
+            frsky.update()
+            for want in wants_copy:
+                data = frsky.get_data(want)
+                if data is None:
+                    continue
+                self.progress("Checking %s" % str(want))
+                if wants[want](data):
+                    self.progress("  Fulfilled")
+                    del wants[want]
+
+    def test_frsky_sport(self):
+        self.set_parameter("SERIAL5_PROTOCOL", 4) # serial5 is FRSky sport
+        self.customise_SITL_commandline([
+            "--uartF=tcp:6735" # serial5 spews to localhost:6735
+        ])
+        frsky = FRSkySPort(("127.0.0.1", 6735))
+        self.wait_ready_to_arm()
+        self.drain_mav_unparsed()
+        # anything with a lambda in here needs a proper test written.
+        # This, at least makes sure we're getting some of each
+        # message.
+        wants = {
+            0x02: lambda x : True,
+            0x04: lambda x : True,
+            0x05: lambda x : True,
+            0x10: lambda x : True,
+            0x13: lambda x : True,
+            0x1B: lambda x : True,
+            0x21: lambda x : True,
+            0x39: lambda x : True,
+        }
+        tstart = self.get_sim_time_cached()
+        last_wanting_print = 0
+        while len(wants):
+            now = self.get_sim_time()
+            if now - last_wanting_print > 1:
+                self.progress("Still wanting (%s)" % ",".join([ ("0x%02x" % x) for x in wants.keys()]))
+                last_wanting_print = now
+            wants_copy = copy.copy(wants)
+            if now - tstart > 10:
+                raise AutoTestTimeoutException("Failed to get frsky data")
+            frsky.update()
+            for want in wants_copy:
+                data = frsky.get_data(want)
+                if data is None:
+                    continue
+                self.progress("Checking %s" % str(want))
+                if wants[want](data):
+                    self.progress("  Fulfilled")
+                    del wants[want]
+
+    def test_frsky_d(self):
+        self.set_parameter("SERIAL5_PROTOCOL", 3) # serial5 is FRSky output
+        self.customise_SITL_commandline([
+            "--uartF=tcp:6735" # serial5 spews to localhost:6735
+        ])
+        frsky = FRSkyD(("127.0.0.1", 6735))
+        self.wait_ready_to_arm()
+        self.drain_mav_unparsed()
+        m = self.mav.recv_match(type='GLOBAL_POSITION_INT', blocking=True, timeout=1)
+        if m is None:
+            raise NotAchievedException("Did not receive GLOBAL_POSITION_INT")
+        gpi_abs_alt = m.alt / 1000 # mm -> m
+        tstart = self.get_sim_time_cached()
+        while True:
+            t2 = self.get_sim_time_cached()
+            if t2 - tstart > 10:
+                raise AutoTestTimeoutException("Failed to get frsky data")
+            frsky.update()
+            alt = frsky.get_data(frsky.dataid_GPS_ALT_BP)
+            self.progress("Got alt (%s)" % str(alt))
+            if alt is None:
+                continue
+            self.drain_mav_unparsed()
+            if alt == gpi_abs_alt:
+                break
 
     def tests(self):
         return [

@@ -1642,6 +1642,18 @@ class AutoTestPlane(AutoTest):
              "Test Buttons",
              self.test_button),
 
+            ("FRSkySPort",
+             "Test FrSky SPort mode",
+             self.test_frsky_sport),
+
+            ("FRSkyPassThrough",
+             "Test FrSky PassThrough serial output",
+             self.test_frsky_passthrough),
+
+            ("FRSkyD",
+             "Test FrSkyD serial output",
+             self.test_frsky_d),
+
             ("AdvancedFailsafe",
              "Test Advanced Failsafe",
              self.test_advanced_failsafe),

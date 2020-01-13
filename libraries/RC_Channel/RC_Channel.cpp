@@ -451,6 +451,7 @@ void RC_Channel::init_aux_function(const aux_func_t ch_option, const aux_switch_
     // init channel options
     switch(ch_option) {
     // the following functions do not need to be initialised:
+    case AUX_FUNC::ARMDISARM:
     case AUX_FUNC::CAMERA_TRIGGER:
     case AUX_FUNC::CLEAR_WP:
     case AUX_FUNC::COMPASS_LEARN:
@@ -515,6 +516,22 @@ bool RC_Channel::read_aux()
     return true;
 }
 
+
+void RC_Channel::do_aux_function_armdisarm(const aux_switch_pos_t ch_flag)
+{
+    // arm or disarm the vehicle
+    switch (ch_flag) {
+    case HIGH:
+        AP::arming().arm(AP_Arming::Method::AUXSWITCH, true);
+        break;
+    case MIDDLE:
+        // nothing
+        break;
+    case LOW:
+        AP::arming().disarm();
+        break;
+    }
+}
 
 void RC_Channel::do_aux_function_avoid_adsb(const aux_switch_pos_t ch_flag)
 {
@@ -806,18 +823,7 @@ void RC_Channel::do_aux_function(const aux_func_t ch_option, const aux_switch_po
         break;
 
     case AUX_FUNC::ARMDISARM:
-        // arm or disarm the vehicle
-        switch (ch_flag) {
-        case HIGH:
-            AP::arming().arm(AP_Arming::Method::AUXSWITCH, true);
-            break;
-        case MIDDLE:
-            // nothing
-            break;
-        case LOW:
-            AP::arming().disarm();
-            break;
-        }
+        do_aux_function_armdisarm(ch_flag);
         break;
 
     case AUX_FUNC::COMPASS_LEARN:
