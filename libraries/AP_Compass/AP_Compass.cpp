@@ -850,8 +850,6 @@ void Compass::_detect_backends(void)
     case AP_BoardConfig::PX4_BOARD_PIXHAWK_PRO:
     case AP_BoardConfig::PX4_BOARD_AEROFC:
         _probe_external_i2c_compasses();
-        ADD_BACKEND(DRIVER_RM3100, AP_Compass_RM3100::probe(hal.spi->get_device("rm3100"), 
-                                                    false, ROTATION_PITCH_180));
         if (_backend_count == COMPASS_MAX_BACKEND ||
             _compass_count == COMPASS_MAX_INSTANCES) {
             return;

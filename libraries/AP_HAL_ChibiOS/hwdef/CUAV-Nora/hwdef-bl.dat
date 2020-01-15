@@ -16,7 +16,7 @@ USB_STRING_SERIAL  "%SERIAL%"
 
 
 # board ID for firmware load
-APJ_BOARD_ID 139
+APJ_BOARD_ID 146
 
 FLASH_SIZE_KB 2048
 
